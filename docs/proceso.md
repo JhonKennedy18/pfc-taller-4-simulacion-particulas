@@ -404,3 +404,122 @@ de tamaño 2, y `2 + 2 = 4`.
 es el mismo árbol que `pasoParalelo(e5, 2.0, 1)` de la sección 1.4 pero con 1024 partículas) y
 `trabajo(1024) / 4 = 256.0`. Resultado ejecutado: **267.0**. El uso de esta estimación contra los tiempos
 medidos está en el informe de paralelización.
+
+
+## 5. Punto 5: medir la aceleración
+
+### 5.1 `aceleracion`
+
+```Scala
+def aceleracion(tSecuencial: Double, tParalelo: Double): Double =
+  tSecuencial / tParalelo
+```
+
+Es el cociente entre el tiempo de la versión secuencial y el de la paralela. No usa recursión, porque es una sola operación.
+Si el resultado es mayor que 1, el paralelo ganó; si es 1, tardaron lo mismo; si es menor que 1, el reparto costó más de lo que ahorró.
+
+| llamado | `tSecuencial` | `tParalelo` | resultado |
+|---|---:|---:|---:|
+| `aceleracion(100.0, 25.0)` | 100.0 | 25.0 | 4.0 |
+| `aceleracion(100.0, 100.0)` | 100.0 | 100.0 | 1.0 |
+| `aceleracion(50.0, 100.0)` | 50.0 | 100.0 | 0.5 |
+| `aceleracion(0.0, 10.0)` | 0.0 | 10.0 | 0.0 |
+
+### 5.2 `medir`
+
+```Scala
+def medir[A](repeticiones: Int)(cuerpo: => A): Double = {
+  val muestras = Vector.fill(repeticiones) {
+    (withWarmer(new Warmer.Default) measure { cuerpo }).value
+  }
+  muestras.sorted.apply(muestras.length / 2)
+}
+```
+
+Viene dada con el material. Cada una de las `repeticiones` mediciones de ScalaMeter calienta la máquina virtual y devuelve
+un tiempo en milisegundos. Luego se ordenan las muestras y se toma la del medio, la **mediana**: con 5 muestras es la de
+índice 2 y con 3 es la de índice 1. La mediana se usa porque una corrida atípica, por ejemplo una pausa del recolector de basura, no la mueve.
+
+### 5.3 `umbralConveniente`
+
+```Scala
+def umbralConveniente(s: Sistema, dt: Double, umbrales: List[Int]): Int =
+  umbrales
+    .map(u => (u, medir(3)(pasoParalelo(s, dt, u))))
+    .minByOption(_._2)
+    .map(_._1)
+    .getOrElse(s.length)
+```
+
+No usa recursión ni variables: es una cadena de funciones de la biblioteca sobre la lista de candidatos. Paso a paso:
+
+1. `.map(u => (u, medir(3)(pasoParalelo(s, dt, u))))` convierte cada candidato `u` en una pareja `(u, t)`, donde `t` es la mediana de 3 mediciones de ScalaMeter de `pasoParalelo(s, dt, u)`. La lista resultante tiene un elemento por candidato y en el mismo orden.
+2. `.minByOption(_._2)` busca la pareja de menor tiempo. Devuelve `Some(pareja)` si la lista no está vacía y `None` si está vacía. Si dos parejas empatan, la biblioteca de Scala devuelve la primera.
+3. `.map(_._1)` toma, dentro del `Option`, solo el umbral de la pareja: `Some(u)` o `None`.
+4. `.getOrElse(s.length)` entrega el umbral, o `s.length` si no había candidatos. Un umbral igual al tamaño no reparte nada, que es lo que el enunciado pide con la lista vacía.
+
+**Traza con candidatos `List(1000, 10000, 100000)`.** Para ilustrar el mecanismo se usan los tiempos de `pasoParalelo` de la corrida 1 de `App.scala` con $n = 1.000.000$ (tabla del informe de paralelización). `umbralConveniente` mediría por su cuenta con `medir(3)`, así que sus tiempos serían parecidos pero no idénticos:
+
+| paso | expresión | resultado |
+|---:|---|---|
+| 1 | `umbrales.map(...)` | `List((1000, 12.67), (10000, 12.85), (100000, 16.80))` |
+| 2 | `.minByOption(_._2)` | `Some((1000, 12.67))` |
+| 3 | `.map(_._1)` | `Some(1000)` |
+| 4 | `.getOrElse(s.length)` | `1000` |
+
+**Traza con `umbrales = Nil`.** `Nil.map(...)` es `Nil` y no se mide nada. `Nil.minByOption(_._2)` es `None`, `None.map(_._1)` es `None` y `None.getOrElse(s.length)` es `s.length`.
+
+### 5.4 La medición en `App.scala`
+
+```Scala
+object App {
+
+  def main(args: Array[String]): Unit = {
+    val sim = new SimulacionParticulas()
+    import sim._
+
+    val dt = 0.5
+    val repeticiones = 5
+    val tamanos = List(1000000, 2000000)
+    val umbrales = List(1000, 10000, 100000)
+
+    println(s"Núcleos disponibles: ${Runtime.getRuntime.availableProcessors}")
+    println("n | umbral | secuencial (ms) | paralelo (ms) | aceleración")
+
+    tamanos.foreach { n =>
+      val sistema: Sistema = Array.tabulate(n)(i =>
+        Particula(Vector2(i, -i), Vector2(1, 2), 1.0 + i % 3))
+      val tSec = medir(repeticiones)(pasoSecuencial(sistema, dt))
+      // El último candidato es el control: umbral = n, no reparte nada.
+      (umbrales :+ n).foreach { u =>
+        val tPar = medir(repeticiones)(pasoParalelo(sistema, dt, u))
+        println(f"$n%9d | $u%9d | $tSec%10.2f | $tPar%10.2f | ${aceleracion(tSec, tPar)}%6.2f")
+      }
+    }
+  }
+}
+```
+
+Para cada tamaño `n` de la lista (1 y 2 millones) el programa:
+
+1. Crea el sistema con `Array.tabulate`: la partícula $i$ está en $(i, -i)$, con velocidad $(1, 2)$ y masa $1 + (i \bmod 3)$.
+2. Mide **una vez** `pasoSecuencial` con `medir(5)`: la mediana de 5 mediciones de ScalaMeter, cada una con calentamiento. Ese `tSec` se reutiliza en todas las filas de ese tamaño.
+3. Recorre `umbrales :+ n`, es decir, los tres umbrales y al final `n`. Para cada `u` mide `pasoParalelo(sistema, dt, u)` con `medir(5)` y calcula `aceleracion(tSec, tPar)`.
+4. Imprime una fila con el formato `n | umbral | secuencial | paralelo | aceleración`.
+
+El último umbral de cada tamaño es `n`: no reparte nada y es la **fila de control**. Los recorridos de listas se hacen con `foreach`, sin `for`, `while` ni variables mutables.
+
+```mermaid
+flowchart TD
+    A["crear sistema de n partículas con Array.tabulate"] --> B["tSec = medir(5) de pasoSecuencial"]
+    B --> C["para cada u en umbrales con n al final"]
+    C --> D["tPar = medir(5) de pasoParalelo con umbral u"]
+    D --> E["imprime la fila con aceleracion(tSec, tPar)"]
+    E --> C
+```
+
+**Traza de una fila.** Con $n = 1.000.000$ y $u = 1000$, la corrida 1 midió `tSec` = 20.50 ms y `tPar` = 12.67 ms, y `aceleracion(20.50, 12.67)` imprimió 1.62.
+
+**Traza de la fila de control.** Con $u = n$, `pasoParalelo` entra a `aux(0, n)`, cumple `n - 0 <= n` y ejecuta `pasoSegmento(s, dt, 0, n)`. Esa es la misma llamada con la que `pasoSecuencial` delega en `pasoSegmento(s, dt, 0, s.length)`, así que las dos versiones hacen el mismo trabajo y la aceleración debe dar cerca de 1. En la corrida 1 con $n = 1.000.000$ el control midió 20.50 ms contra 20.99 ms y dio 0.98.
+
+Los tiempos completos, con las dos corridas y su lectura, están en el informe de paralelización.
